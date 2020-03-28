@@ -1,0 +1,6 @@
+/home/joaocrm/Documentos/Pessoais/CUDA/cuda_dsmc/build/CMakeFiles/clean-cmake.dir
+/home/joaocrm/Documentos/Pessoais/CUDA/cuda_dsmc/build/CMakeFiles/cuda_dsmc.dir
+/home/joaocrm/Documentos/Pessoais/CUDA/cuda_dsmc/build/CMakeFiles/host_distribution_evolution_test.dir
+/home/joaocrm/Documentos/Pessoais/CUDA/cuda_dsmc/build/CMakeFiles/host_distribution_generation_test.dir
+/home/joaocrm/Documentos/Pessoais/CUDA/cuda_dsmc/build/CMakeFiles/host_random_number_generation_test.dir
+/home/joaocrm/Documentos/Pessoais/CUDA/cuda_dsmc/build/CMakeFiles/run.dir

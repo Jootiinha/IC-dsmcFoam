@@ -1,0 +1,1611 @@
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     |
+    \\  /    A nd           | Copyright (C) 2009-2010 OpenCFD Ltd.
+     \\/     M anipulation  |
+-------------------------------------------------------------------------------
+License
+    This file is part of OpenFOAM.
+
+    OpenFOAM is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+    for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
+
+\*---------------------------------------------------------------------------*/
+
+#include "dsmcCloud.H"
+#include "constants.H"
+#include "zeroGradientFvPatchFields.H"
+
+using namespace Foam::constant;
+
+namespace Foam
+{
+    defineTemplateTypeNameAndDebug(Cloud<dsmcParcel>, 0);
+};
+
+// * * * * * * * * * * * * * Private Member Functions  * * * * * * * * * * * //
+
+
+void Foam::dsmcCloud::buildConstProps()
+{
+    Info<< nl << "Constructing constant properties for" << endl;
+    constProps_.setSize(typeIdList_.size());
+
+    dictionary moleculeProperties
+    (
+        particleProperties_.subDict("moleculeProperties")
+    );
+
+    forAll(typeIdList_, i)
+    {
+        const word& id(typeIdList_[i]);
+
+        Info<< "    " << id << endl;
+
+        const dictionary& molDict(moleculeProperties.subDict(id));
+
+        constProps_[i] = dsmcParcel::constantProperties(molDict);
+    }
+}
+
+
+
+void Foam::dsmcCloud::buildCellOccupancy()
+{
+    forAll(cellOccupancy_, cO)
+    {
+        cellOccupancy_[cO].clear();
+    }
+
+   forAllIter(dsmcCloud, *this, iter)
+    {
+        if(iter().stuckToWall() != 1)
+        {
+            cellOccupancy_[iter().cell()].append(&iter());
+        }
+    }
+}
+
+void Foam::dsmcCloud::removeElectrons()
+{   
+    forAll(cellOccupancy_, c)
+    {
+        const DynamicList<dsmcParcel*>& molsInCell = cellOccupancy_[c];
+        
+        forAll(molsInCell, mIC)
+        {
+            dsmcParcel* p = molsInCell[mIC];
+            
+            const dsmcParcel::constantProperties& constProp 
+                                = constProps(p->typeId());
+                                
+            const label& charge = constProp.charge();
+            
+            scalar RWF = 1.0;
+            
+            if(axisymmetric_)
+            {
+                const point& cC = mesh_.cellCentres()[c];
+                scalar radius = cC.y();
+                
+                RWF = 1.0 + maxRWF_*(radius/radialExtent_);
+            }
+            
+            scalar mass = constProps(p->typeId()).mass();
+            
+            momentumMean_[c] += mass*RWF*p->U();
+            rhoMMean_[c] += mass*RWF;
+            
+            if(charge == -1)
+            {
+                rhoNMeanElectron_[c] += 1.0*RWF;
+                rhoMMeanElectron_[c] += mass*RWF;
+                momentumMeanElectron_[c] += mass*RWF*p->U();
+                linearKEMeanElectron_[c] += mass*RWF*(p->U() & p->U());
+                
+                //found an electron
+                deleteParticle(*p);
+            }
+        }
+    }
+}
+
+void Foam::dsmcCloud::addElectrons()
+{      
+    label electronTypeId = -1;
+            
+    //find electron typeId
+    //List<dsmcParcel::constantProperties> constProps_;
+    //forAll é o for loop do openFoam => Equivalente a for(int cp = 0; i<constProps.size(); cp++){...}
+    forAll(constProps_, cP)
+    {
+
+        //Aqui a label(long long) recebe o estado de carga do elétron
+        const label& electronCharge = constProps_[cP].charge();
+        
+        if(electronCharge == -1)
+        {
+            electronTypeId = cP;
+            break;
+        }
+    }
+    
+    forAll(cellOccupancy_, c)
+    {                
+        if(rhoMMeanElectron_[c] > VSMALL)
+        {
+           scalar V = mesh_.cellVolumes()[c];
+                
+            scalar rhoMMeanElectron = rhoMMeanElectron_[c]*nParticle_/V;
+            scalar rhoNMeanElectron = rhoNMeanElectron_[c]*nParticle_/V;
+            vector UElectron = momentumMeanElectron_[c] /(rhoMMeanElectron*V);
+            scalar linearKEMeanElectron = 
+                                (0.5*linearKEMeanElectron_[c]*nParticle_)/V;
+            
+            electronTemperature_[c] = 2.0/(3.0*physicoChemical::k.value()
+                                    *rhoNMeanElectron)*(linearKEMeanElectron 
+                                    - 0.5*rhoMMeanElectron
+                                    *(UElectron & UElectron));
+        }
+        
+        const DynamicList<dsmcParcel*>& molsInCell = cellOccupancy_[c];
+        
+        forAll(molsInCell, mIC)
+        {
+            dsmcParcel* p = molsInCell[mIC];
+            
+            const dsmcParcel::constantProperties& constProp 
+                                = constProps(p->typeId());
+                                
+            label charge = constProp.charge();
+        
+            if(charge  == 1)
+            {
+                //found an ion, add an electron here
+                
+                //electron temperature will be zero if there have been no
+                //electrons in the cell during the simulation
+                
+//                 label cellI = p->cell();
+//                 vector position = p->position();
+//                 label tetFaceI = p->tetFace();
+//                 label tetPtI = p->tetPt();
+                
+                vector position = p->position();
+                
+                label cellI = -1;
+                label tetFaceI = -1;
+                label tetPtI = -1;
+
+                mesh_.findCellFacePt
+                (
+                    position,
+                    cellI,
+                    tetFaceI,
+                    tetPtI
+                );
+                
+                if(electronTemperature_[cellI] < VSMALL)
+                {
+                    electronTemperature_[cellI] = 6000.0;
+                }
+                if(electronTemperature_[cellI] > 8.0e4)
+                {
+                    electronTemperature_[cellI] = 30000.0;
+                }
+                    
+
+                vector electronVelocity = equipartitionLinearVelocity
+                    (
+                        electronTemperature_[cellI],
+                        constProps_[electronTypeId].mass()
+                    );
+                
+                if(rhoMMean_[cellI] > VSMALL)
+                {
+                    cellVelocity_[cellI] = momentumMean_[cellI]
+                                                        /rhoMMean_[cellI];
+                }
+                
+                labelList vibLevel(0,0);
+                    
+                electronVelocity += cellVelocity_[cellI];
+
+                scalar RWF = p->RWF();
+                
+                scalarField wallTemperature(3, 0.0);
+                
+                vectorField wallVectors(3, vector::zero);
+
+                addNewParcel
+                (
+                    position,
+                    electronVelocity,
+                    RWF,
+                    0.0,
+                    0,
+                    cellI,
+                    tetFaceI,
+                    tetPtI,
+                    electronTypeId,
+                    0,
+                    0,
+                    0,
+                    wallTemperature,
+                    wallVectors,
+                    vibLevel
+                );
+            }
+        }
+    }
+}
+
+void Foam::dsmcCloud::releaseParticlesFromWall()
+{ 
+    label i = -1;
+    
+    forAllIter(dsmcCloud, *this, iter)
+    {
+        i++;
+        
+        if(iter().stuckToWall() == 1)
+        {
+            //- Calculate probability this particle will be released
+            scalar residencyTime = 0.5;
+            const scalar deltaT = mesh_.time().deltaTValue();
+            
+            if(rndGen_.scalar01() < (deltaT/residencyTime))
+            {
+                iter().stuckToWall() = 0;
+                
+                iter().U() = sqrt(physicoChemical::k.value()
+                                *iter().wallTemperature()[0]
+                                /constProps_[iter().typeId()].mass())
+                        *(
+                            rndGen_.GaussNormal()*iter().wallVectors()[0]
+                        + rndGen_.GaussNormal()*iter().wallVectors()[1]
+                        - sqrt(-2.0*log(max(1 - rndGen_.scalar01(), VSMALL)))
+                                *iter().wallVectors()[2]
+                        );
+
+                label wppIndex = iter().wallTemperature()[1];
+                const polyPatch& wpp = mesh_.boundaryMesh()[wppIndex];
+                label wppLocalFace = iter().wallTemperature()[2];
+            
+                const scalar fA = mag(wpp.faceAreas()[wppLocalFace]);
+            
+                const scalar deltaT = mesh_.time().deltaTValue();
+                
+                const dsmcParcel::constantProperties& constProp 
+                                = constProps(iter().typeId());
+            
+                scalar m = constProp.mass();
+            
+                vector nw = wpp.faceAreas()[wppLocalFace];
+                nw /= mag(nw);
+            
+                scalar U_dot_nw = iter().U() & nw;
+            
+                vector Ut = iter().U() - U_dot_nw*nw;
+            
+                scalar invMagUnfA = 1/max(mag(U_dot_nw)*fA, VSMALL);
+
+                boundaryFluxMeasurements().rhoNBF()[iter().typeId()]
+                                    [wppIndex][wppLocalFace] += invMagUnfA;
+                if(constProp.rotationalDegreesOfFreedom() > 0)
+                {
+                boundaryFluxMeasurements().rhoNIntBF()[iter().typeId()]
+                                        [wppIndex][wppLocalFace] += invMagUnfA; 
+                }
+                if(constProp.numberOfElectronicLevels() > 1)
+                {
+                boundaryFluxMeasurements().rhoNElecBF()[iter().typeId()]
+                                        [wppIndex][wppLocalFace] += invMagUnfA; 
+                }
+                boundaryFluxMeasurements().rhoMBF()[iter().typeId()]
+                                    [wppIndex][wppLocalFace] += m*invMagUnfA;
+                boundaryFluxMeasurements().linearKEBF()[iter().typeId()]
+                            [wppIndex][wppLocalFace] += 0.5*m
+                                        *(iter().U() & iter().U())*invMagUnfA;
+                boundaryFluxMeasurements().momentumBF()[iter().typeId()]
+                                [wppIndex][wppLocalFace] += m*Ut*invMagUnfA;
+                boundaryFluxMeasurements().rotationalEBF()[iter().typeId()]
+                        [wppIndex][wppLocalFace] += iter().ERot()*invMagUnfA;
+                boundaryFluxMeasurements().rotationalDofBF()[iter().typeId()]
+                                [wppIndex][wppLocalFace] += 
+                            constProp.rotationalDegreesOfFreedom()*invMagUnfA;
+                forAll(iter().vibLevel(), i)
+                {
+                    boundaryFluxMeasurements().vibrationalEBF()[iter().typeId()]
+                                [wppIndex][wppLocalFace] += 
+                                    iter().vibLevel()[i]*constProp.thetaV()[i]
+                                    *physicoChemical::k.value()*invMagUnfA;
+                }
+                boundaryFluxMeasurements().electronicEBF()[iter().typeId()]
+                            [wppIndex][wppLocalFace] += 
+                            constProp.electronicEnergyList()[iter().ELevel()]
+                            *invMagUnfA;
+                
+                // post-interaction energy
+                scalar postIE = 0.5*m*(iter().U() & iter().U()) + iter().ERot()
+                        + constProp.electronicEnergyList()[iter().ELevel()];
+                
+                forAll(iter().vibLevel(), i)
+                {
+                    postIE +=  iter().vibLevel()[i]*constProp.thetaV()[i]
+                                                *physicoChemical::k.value();
+                }
+                
+                // post-interaction momentum
+                vector postIMom = m*iter().U();
+                
+                scalar preIE = iter().wallTemperature()[3];
+                vector preIMom = iter().wallVectors()[3];
+            
+                scalar deltaQ = nParticle()*(preIE - postIE)/(deltaT*fA);
+                vector deltaFD = nParticle()*(preIMom - postIMom)/(deltaT*fA);
+                
+                boundaryFluxMeasurements().qBF()[iter().typeId()]
+                                    [wppIndex][wppLocalFace] += deltaQ;
+                boundaryFluxMeasurements().fDBF()[iter().typeId()]
+                                    [wppIndex][wppLocalFace] += deltaFD;
+                
+                iter().wallTemperature()[0] = 0.0;
+                iter().wallVectors() = vector::zero;
+            }
+        }
+    }
+}
+
+
+Foam::label Foam::dsmcCloud::pickFromCandidateList
+(
+    DynamicList<label>& candidatesInCell
+)
+{
+    label entry = -1;
+    label size = candidatesInCell.size();
+
+    if(size > 0)
+    {
+        // choose a random number between 0 and the size of the candidateList
+        label randomIndex = rndGen_.integer(0, size - 1);
+        entry = candidatesInCell[randomIndex];
+
+        // build a new list without the chosen entry
+        DynamicList<label> newCandidates(0);
+    
+        forAll(candidatesInCell, i)
+        {
+            if(i != randomIndex)
+            {
+                newCandidates.append(candidatesInCell[i]);
+            }
+        }
+
+        // transfer the new list
+        candidatesInCell.transfer(newCandidates);
+        candidatesInCell.shrink();
+    }
+
+    return entry;
+}
+
+void Foam::dsmcCloud::updateCandidateSubList
+(
+    const label& candidate,
+    DynamicList<label>& candidatesInSubCell
+)
+{
+    label newIndex = findIndex(candidatesInSubCell, candidate);
+
+    DynamicList<label> newCandidates(0);
+
+    forAll(candidatesInSubCell, i)
+    {
+        if(i != newIndex)
+        {
+            newCandidates.append(candidatesInSubCell[i]);
+        }
+    }
+
+    // transfer the new list
+    candidatesInSubCell.transfer(newCandidates);
+    candidatesInSubCell.shrink();
+}
+
+
+Foam::label Foam::dsmcCloud::pickFromCandidateSubList
+(
+    DynamicList<label>& candidatesInCell,
+    DynamicList<label>& candidatesInSubCell
+)
+{
+    label entry = -1;
+    label subCellSize = candidatesInSubCell.size();
+    
+    if(subCellSize > 0)
+    {
+        label randomIndex = rndGen_.integer(0, subCellSize - 1);
+        entry = candidatesInSubCell[randomIndex];
+
+        DynamicList<label> newSubCellList(0);
+
+        forAll(candidatesInSubCell, i)
+        {
+            if(i != randomIndex)
+            {
+                newSubCellList.append(candidatesInSubCell[i]);
+            }
+        }
+
+        candidatesInSubCell.transfer(newSubCellList);
+        candidatesInSubCell.shrink();
+
+        label newIndex = findIndex(candidatesInCell, entry);
+
+        DynamicList<label> newList(0);
+    
+        forAll(candidatesInCell, i)
+        {
+            if(i != newIndex)
+            {
+                newList.append(candidatesInCell[i]);
+            }
+        }
+
+        candidatesInCell.transfer(newList);
+        candidatesInCell.shrink();
+    }
+
+    return entry;
+}
+
+void Foam::dsmcCloud::collisions()
+{
+    collisionPartnerSelectionModel_->collide();
+}
+
+// * * * * * * * * * * * Protected Member Functions  * * * * * * * * * * * * //
+
+
+void Foam::dsmcCloud::addNewParcel
+(
+    const vector& position,
+    const vector& U,
+    const scalar RWF,
+    const scalar ERot,
+    const label ELevel,
+    const label cellI,
+    const label tetFaceI,
+    const label tetPtI,
+    const label typeId,
+    const label newParcel,
+    const label classification,
+    const label stuckToWall,
+    const scalarField wallTemperature,
+    const vectorField wallVectors,
+    const labelList vibLevel
+)
+{
+    dsmcParcel* pPtr = new dsmcParcel
+    (
+        mesh_,
+        position,
+        U,
+        RWF,
+        ERot,
+        ELevel,
+        cellI,
+        tetFaceI,
+        tetPtI,
+        typeId,
+        newParcel,
+        classification,
+        stuckToWall,
+        wallTemperature,
+        wallVectors,
+        vibLevel
+    );
+
+    addParticle(pPtr);
+}
+
+Foam::scalar Foam::dsmcCloud::energyRatio
+(
+    scalar ChiA,
+    scalar ChiB
+)
+{
+    scalar ChiAMinusOne = ChiA - 1;
+
+    scalar ChiBMinusOne = ChiB - 1;
+
+    if (ChiAMinusOne < SMALL && ChiBMinusOne < SMALL)
+    {
+        return rndGen_.scalar01();
+    }
+
+    scalar energyRatio;
+
+    scalar P;
+
+    do
+    {
+        P = 0;
+
+        energyRatio = rndGen_.scalar01();
+
+        if (ChiAMinusOne < SMALL)
+        {
+            P = pow((1.0 - energyRatio),ChiBMinusOne);
+        }
+        else if (ChiBMinusOne < SMALL)
+        {
+            P = pow((1.0 - energyRatio),ChiAMinusOne);
+        }
+        else
+        {
+            P =
+                pow
+                (
+                    (ChiAMinusOne + ChiBMinusOne)*energyRatio/ChiAMinusOne,
+                    ChiAMinusOne
+                )
+               *pow
+                (
+                    (ChiAMinusOne + ChiBMinusOne)*(1 - energyRatio)
+                    /ChiBMinusOne,
+                    ChiBMinusOne
+                );
+        }
+    } while (P < rndGen_.scalar01());
+
+    return energyRatio;
+}
+
+Foam::scalar Foam::dsmcCloud::PSIm
+(
+    scalar DOFm,
+    scalar DOFtot
+)
+{
+    if (DOFm == DOFtot)
+    {
+        return 1.0;
+    }
+
+    if (DOFm == 2.0 && DOFtot == 4.0)
+    {
+        return rndGen_.scalar01();
+    }
+
+    if (DOFtot < 4.0)
+    {
+        return (DOFm/DOFtot);
+    }
+    
+    scalar rPSIm = 0.0;
+    scalar prob = 0.0;
+
+    scalar h1 = 0.5*DOFtot - 2.0;
+    scalar h2 = 0.5*DOFm - 1.0 + 1.0e-5;
+    scalar h3 = 0.5*(DOFtot-DOFm)-1.0 + 1.0e-5;
+
+    do
+    {
+        rPSIm = rndGen_.scalar01();
+        prob = pow(h1,h1)/(pow(h2,h2)*pow(h3,h3))*pow(rPSIm,h2)
+                                                    *pow(1.0-rPSIm,h3);
+    } while (prob < rndGen_.scalar01());
+
+    return rPSIm;
+}
+
+
+// * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
+
+// for running dsmcFoamPlus
+Foam::dsmcCloud::dsmcCloud
+(
+    Time& t,
+    const word& cloudName,
+    const fvMesh& mesh,
+    bool readFields
+)
+:
+    Cloud<dsmcParcel>(mesh, cloudName, false),
+    cloudName_(cloudName),
+    mesh_(mesh),
+    particleProperties_
+    (
+        IOobject
+        (
+            cloudName + "Properties",
+            mesh_.time().constant(),
+            mesh_,
+            IOobject::MUST_READ_IF_MODIFIED,
+            IOobject::NO_WRITE
+        )
+    ),
+    controlDict_
+    (
+        IOobject
+        (
+            "controlDict",
+            mesh_.time().system(),
+            mesh_,
+            IOobject::MUST_READ_IF_MODIFIED,
+            IOobject::NO_WRITE
+        )
+    ),
+    typeIdList_(particleProperties_.lookup("typeIdList")),
+    nParticle_(readScalar(particleProperties_.lookup("nEquivalentParticles"))),
+    axisymmetric_(Switch(particleProperties_.lookup("axisymmetricSimulation"))),
+    radialExtent_(0.0),
+    maxRWF_(1.0),
+    charged_(Switch(particleProperties_.lookup("chargedParticles"))),
+    adsorption_(Switch(particleProperties_.lookup("adsorption"))),
+    nTerminalOutputs_(readLabel(controlDict_.lookup("nTerminalOutputs"))),
+    cellOccupancy_(mesh_.nCells()),
+    rhoNMeanElectron_(mesh_.nCells(),0.0),
+    rhoMMeanElectron_(mesh_.nCells(),0.0),
+    rhoMMean_(mesh_.nCells(),0.0),
+    momentumMeanElectron_(mesh_.nCells(), vector::zero),
+    momentumMean_(mesh_.nCells(), vector::zero),
+    linearKEMeanElectron_(mesh_.nCells(), 0.0),
+    electronTemperature_(mesh_.nCells(), 0.0),
+    cellVelocity_(mesh_.nCells(), vector::zero),
+    sigmaTcRMax_
+    (
+        IOobject
+        (
+            this->name() + "SigmaTcRMax",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::MUST_READ,
+            IOobject::AUTO_WRITE
+        ),
+        mesh_
+    ),
+    collisionSelectionRemainder_(mesh_.nCells(), 0),
+    constProps_(),
+    rndGen_(label(clock::getTime()) + 7183*Pstream::myProcNo()),
+    controllers_(t, mesh, *this),
+    dynamicLoadBalancing_(t, mesh, *this),
+    fields_(t, mesh, *this),
+    boundaries_(t, mesh, *this),
+    trackingInfo_(mesh, *this, true),
+    binaryCollisionModel_
+    (
+        BinaryCollisionModel::New
+        (
+            particleProperties_,
+            *this
+        )
+    ),
+    collisionPartnerSelectionModel_(),
+    reactions_(t, mesh, *this),
+    boundaryMeas_(mesh, *this, true),
+    cellMeas_(mesh, *this, true)
+{
+    if (readFields)
+    {
+        dsmcParcel::readFields(*this);
+    }
+
+    buildConstProps();
+    
+    if(axisymmetric_)
+    {
+        radialExtent_ = 
+                readScalar(particleProperties_.lookup("radialExtentOfDomain"));
+        maxRWF_ = 
+            readScalar(particleProperties_.lookup("maxRadialWeightingFactor"));
+        maxRWF_ -= 1.0;
+    }
+
+
+    reactions_.initialConfiguration();
+
+    buildCellOccupancy();
+
+    // Initialise the collision selection remainder to a random value between 0
+    // and 1.
+    forAll(collisionSelectionRemainder_, i)
+    {
+        collisionSelectionRemainder_[i] = rndGen_.scalar01();
+    }
+
+    collisionPartnerSelectionModel_ = autoPtr<collisionPartnerSelection>
+    (
+    collisionPartnerSelection::New(mesh, *this, particleProperties_)
+    );
+
+    collisionPartnerSelectionModel_->initialConfiguration();
+
+    fields_.createFields();
+    boundaries_.setInitialConfig();
+    controllers_.initialConfig();
+}
+
+
+
+// running dsmcIntialise
+Foam::dsmcCloud::dsmcCloud
+(
+    Time& t,
+    const word& cloudName,
+    const fvMesh& mesh,
+    const IOdictionary& dsmcInitialiseDict,
+    const bool& clearFields
+)
+    :
+    Cloud<dsmcParcel>(mesh, cloudName, false),
+    cloudName_(cloudName),
+    mesh_(mesh),
+    particleProperties_
+    (
+        IOobject
+        (
+            cloudName + "Properties",
+            mesh_.time().constant(),
+            mesh_,
+            IOobject::MUST_READ_IF_MODIFIED,
+            IOobject::NO_WRITE
+        )
+    ),
+    controlDict_
+    (
+        IOobject
+        (
+            "controlDict",
+            mesh_.time().system(),
+            mesh_,
+            IOobject::MUST_READ_IF_MODIFIED,
+            IOobject::NO_WRITE
+        )
+    ),
+    typeIdList_(particleProperties_.lookup("typeIdList")),
+    nParticle_(readScalar(particleProperties_.lookup("nEquivalentParticles"))),
+    axisymmetric_(Switch(particleProperties_.lookup("axisymmetricSimulation"))),
+    radialExtent_(0.0),
+    maxRWF_(1.0),
+    charged_(Switch(particleProperties_.lookup("chargedParticles"))),
+    adsorption_(Switch(particleProperties_.lookup("adsorption"))),
+    nTerminalOutputs_(readLabel(controlDict_.lookup("nTerminalOutputs"))),
+    cellOccupancy_(),
+    rhoNMeanElectron_(),
+    rhoMMeanElectron_(),
+    rhoMMean_(),
+    momentumMeanElectron_(),
+    momentumMean_(),
+    linearKEMeanElectron_(),
+    electronTemperature_(),
+    cellVelocity_(),
+    sigmaTcRMax_
+    (
+        IOobject
+        (
+            this->name() + "SigmaTcRMax",
+            mesh_.time().timeName(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        mesh_,
+        dimensionedScalar("zero",  dimensionSet(0, 3, -1, 0, 0), 0.0),
+        zeroGradientFvPatchScalarField::typeName
+    ),
+    collisionSelectionRemainder_(),
+    constProps_(),
+    rndGen_(label(clock::getTime()) + 1526*Pstream::myProcNo()),
+    controllers_(t, mesh),
+    dynamicLoadBalancing_(t, mesh, *this),
+    fields_(t, mesh),
+    boundaries_(t, mesh),
+    trackingInfo_(mesh, *this),
+    binaryCollisionModel_(),
+    collisionPartnerSelectionModel_(),
+    reactions_(t, mesh),
+    boundaryMeas_(mesh, *this),
+    cellMeas_(mesh, *this)
+{
+    if(!clearFields)
+    {
+        dsmcParcel::readFields(*this);
+    }
+
+    label initialParcels = this->size();
+
+    if (Pstream::parRun())
+    {
+        reduce(initialParcels, sumOp<label>());
+    }
+
+    if(clearFields)
+    {
+        Info << "clearing existing field of parcels " << endl;
+
+        clear();
+
+        initialParcels = 0;
+    }
+    
+    if(axisymmetric_)
+    {
+        radialExtent_ = 
+            readScalar(particleProperties_.lookup("radialExtentOfDomain"));
+        maxRWF_ = 
+            readScalar(particleProperties_.lookup("maxRadialWeightingFactor"));
+        maxRWF_ -= 1.0;
+    }  
+
+    buildConstProps();
+    dsmcAllConfigurations conf(dsmcInitialiseDict, *this);
+    conf.setInitialConfig();
+
+    label finalParcels = this->size();
+    
+    if (Pstream::parRun())
+    {
+        reduce(finalParcels, sumOp<label>());
+    }
+
+    Info << nl << "Initial no. of parcels: " << initialParcels 
+         << " added parcels: " << finalParcels - initialParcels
+         << ", total no. of parcels: " << finalParcels 
+         << endl;
+
+}
+
+// * * * * * * * * * * * * * * * * Destructor  * * * * * * * * * * * * * * * //
+
+
+Foam::dsmcCloud::~dsmcCloud()
+{}
+
+
+// * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
+
+
+void Foam::dsmcCloud::evolve()
+{
+    boundaries_.updateTimeInfo();//****
+    fields_.updateTimeInfo();//****
+    controllers_.updateTimeInfo();//****
+
+    dsmcParcel::trackingData td(*this);
+
+    if (debug)
+    {
+        this->dumpParticlePositions();
+    }
+
+    controllers_.controlBeforeMove();//****
+    boundaries_.controlBeforeMove();//****
+    
+    if(charged_)
+    {
+        //Remove electrons
+        removeElectrons();
+    }
+    
+    if(adsorption_)
+    {
+        releaseParticlesFromWall();
+    }
+    
+    // Move the particles ballistically with their current velocities
+    Cloud<dsmcParcel>::move(td, mesh_.time().deltaTValue());
+    
+    // Update cell occupancy
+    buildCellOccupancy();
+    
+    if(axisymmetric_)
+    {
+        axisymmetricWeighting();
+        buildCellOccupancy();
+    }
+
+    if(charged_)
+    {
+        //Add electrons back after the move function
+        addElectrons();
+        // Update cell occupancy
+        buildCellOccupancy();
+    }
+    controllers_.controlBeforeCollisions();//****
+    boundaries_.controlBeforeCollisions();//****
+//     Info << "collisions" << endl;
+
+    // Calculate new velocities via stochastic collisions
+    collisions();
+    
+     // Update cell occupancy (reactions may have changed it)
+    buildCellOccupancy();
+
+    controllers_.controlAfterCollisions();//****
+    boundaries_.controlAfterCollisions();//****
+
+    reactions_.outputData();
+
+    fields_.calculateFields();//****
+    fields_.writeFields();//****
+
+    controllers_.calculateProps();//****
+    controllers_.outputResults();//****
+
+    boundaries_.calculateProps();//****
+    boundaries_.outputResults();//****
+
+    trackingInfo_.clean(); //****
+    boundaryMeas_.clean(); //****
+    cellMeas_.clean();     
+}
+
+Foam::label Foam::dsmcCloud::nTerminalOutputs()
+{
+    return nTerminalOutputs_;
+}
+
+void Foam::dsmcCloud::info() const
+{
+    label nDsmcParticles = this->size();
+    reduce(nDsmcParticles, sumOp<label>());
+    
+    const scalarList& iM = infoMeasurements();
+
+    scalar nMol = iM[6];
+    reduce(nMol, sumOp<scalar>());
+    
+    scalar linearKineticEnergy = iM[1];
+    reduce(linearKineticEnergy, sumOp<scalar>());
+    
+    scalar rotationalEnergy = iM[2];
+    reduce(rotationalEnergy, sumOp<scalar>());
+    
+    scalar vibrationalEnergy = iM[3];
+    reduce(vibrationalEnergy, sumOp<scalar>());
+    
+    scalar electronicEnergy = iM[4];
+    reduce(electronicEnergy, sumOp<scalar>());
+    
+    scalar stuckMolecules = iM[5];
+    reduce(stuckMolecules, sumOp<scalar>());
+
+//     vector linearMomentum = linearMomentumOfSystem();
+//     reduce(linearMomentum, sumOp<vector>());
+
+//     scalar linearKineticEnergy = linearKineticEnergyOfSystem();
+//     reduce(linearKineticEnergy, sumOp<scalar>());
+// 
+//     scalar rotationalEnergy = rotationalEnergyOfSystem();
+//     reduce(rotationalEnergy, sumOp<scalar>());
+//     
+//     scalar vibrationalEnergy = vibrationalEnergyOfSystem();
+//     reduce(vibrationalEnergy, sumOp<scalar>());
+//     
+//     scalar electronicEnergy = electronicEnergyOfSystem();
+//     reduce(electronicEnergy, sumOp<scalar>());
+
+    Info << "    Number of DSMC particles        = "
+    << nDsmcParticles
+    << endl;
+
+    if (nDsmcParticles > VSMALL)
+    {
+//         Info<< "    Number of molecules             = "
+//             << nMol << nl
+//             << "    Mass in system                  = "
+//             << returnReduce(massInSystem(), sumOp<scalar>()) << nl
+//             << "    Average linear momentum         = "
+//             << linearMomentum/nMol << nl
+//             << "    |Total linear momentum|         = "
+//             << mag(linearMomentum) << nl
+       Info << "    Number of stuck particles       = "
+            << stuckMolecules/nParticle_ << nl
+            << "    Number of free particles        = "
+            << nMol/nParticle_ << nl
+            << "    Average linear kinetic energy   = "
+            << linearKineticEnergy/nMol << nl
+            << "    Average rotational energy       = "
+            << rotationalEnergy/nMol << nl
+            << "    Average vibrational energy      = "
+            << vibrationalEnergy/nMol << nl
+            << "    Average electronic energy       = "
+            << electronicEnergy/nMol << nl
+            << "    Total energy                    = "
+            << (rotationalEnergy + linearKineticEnergy
+                + vibrationalEnergy + electronicEnergy)
+            << endl;
+    }
+}
+
+void Foam::dsmcCloud::loadBalanceCheck()
+{
+    dynamicLoadBalancing_.update();
+}
+
+void Foam::dsmcCloud::loadBalance()
+{
+    dynamicLoadBalancing_.perform();
+}
+
+Foam::vector Foam::dsmcCloud::equipartitionLinearVelocity
+(
+    scalar temperature,
+    scalar mass
+)
+{
+    return
+        sqrt(physicoChemical::k.value()*temperature/mass)
+       *vector
+        (
+            rndGen_.GaussNormal(),
+            rndGen_.GaussNormal(),
+            rndGen_.GaussNormal()
+        );
+}
+
+Foam::scalar Foam::dsmcCloud::equipartitionRotationalEnergy
+(
+    scalar temperature,
+    scalar rotationalDof
+)
+{
+    scalar ERot = 0.0;
+
+    if (rotationalDof < SMALL)
+    {
+        return ERot;
+    }
+    else if (rotationalDof < 2.0 + SMALL && rotationalDof > 2.0 - SMALL)
+    {
+        // Special case for rDof = 2, i.e. diatomics;
+        
+        scalar rand = -1;
+        
+        do
+        {
+            rand = rndGen_.scalar01();
+
+        } while (rand < VSMALL);
+
+        ERot = -log(rand)*physicoChemical::k.value()*temperature;
+    }
+    else
+    {
+        scalar a = 0.5*rotationalDof - 1;
+
+        scalar energyRatio;
+
+        scalar P = -1;
+
+        do
+        {
+            energyRatio = 10*rndGen_.scalar01();
+
+            P = pow((energyRatio/a), a)*exp(a - energyRatio);
+
+        } while (P < rndGen_.scalar01());
+
+        ERot = energyRatio*physicoChemical::k.value()*temperature;
+    }
+
+    return ERot;
+}
+
+Foam::labelList Foam::dsmcCloud::equipartitionVibrationalEnergyLevel
+(
+    scalar temperature,
+    scalar vibrationalDof,
+    label typeId
+)
+{
+    labelList vibLevel(vibrationalDof, 0);
+
+    if (vibrationalDof < SMALL)
+    {
+        return vibLevel;
+    }
+    else
+    {  
+        forAll(vibLevel, i)
+        {
+            label j = -log(rndGen_.scalar01())*temperature/
+                                    constProps(typeId).thetaV()[i];
+            vibLevel[i] = j;
+        }
+    }
+
+    return vibLevel;
+}
+
+Foam::label Foam::dsmcCloud::equipartitionElectronicLevel
+(
+    scalar temperature,
+    List<label> degeneracyList_,
+    List<scalar> electronicEnergyList_,
+    label typeId
+)
+
+{
+    
+    scalar EMax = physicoChemical::k.value()*temperature;
+    label jMax = constProps(typeId).numberOfElectronicLevels();
+    
+    // random integer between 0 and jMax-1.
+    label jDash = 0; 
+    // maximum possible electronic energy level within list based on k*TElec.
+    scalar EJ = 0.0; 
+    // maximum possible degeneracy level within list.
+    label gJ = 0; 
+    // selected intermediate integer electronic level (0 to jMax-1).
+    label jSelect = 0; 
+    // maximum denominator value in Liechty pdf (see below).
+    scalar expMax = 0.0; 
+    // Summation term based on random electronic level. 
+    scalar expSum = 0.0; 
+    // Boltzmann distribution of Eq. 3.1.1 of Liechty thesis.
+    scalar boltz = 0;
+    // distribution function Eq. 3.1.2 of Liechty thesis.
+    scalar func = 0.0; 
+
+    // Only the electron E- has 1 degeneracy level = 0 (for programming 
+    // purposes) in constant/dsmcProperties    
+    if (jMax == 1) 
+    {  
+        return 0;
+    }
+    if(temperature < VSMALL)
+    {
+        return jDash;
+    }
+    else
+    {           
+        // Calculate summation term in denominator of Eq.3.1.1 from Liechty
+        // thesis.     
+        label i = 0;
+        do
+        {
+            expSum += degeneracyList_[i]*exp((-electronicEnergyList_[i]/EMax));  
+            i += 1;
+        } while (i < jMax);     
+
+        // select maximum integer energy level based on boltz value.
+        // Note that this depends on the temperature.   
+        
+        scalar boltzMax = 0.0;
+        
+        for (label ii = 0; ii < jMax; ii++)
+        {
+            //Eq. 3.1.1 of Liechty thesis.   
+            boltz = degeneracyList_[ii]*
+                            exp((-electronicEnergyList_[ii]/EMax))/expSum;
+            
+            if (boltzMax < boltz)
+            {
+                boltzMax = boltz;
+                jSelect = ii;
+            }               
+        }
+        //Max. poss energy in list : list goes from [0] to [jMax-1]
+        EJ = electronicEnergyList_[jSelect]; 
+        //Max. poss degeneracy in list : list goes from [0] to [jMax-1]
+        gJ = degeneracyList_[jSelect];
+        // Max. in denominator of Liechty pdf for initialisation/ wall 
+        // bcs/freestream EEle etc..
+        expMax = gJ*exp((-EJ/EMax)); 
+        
+        do // acceptance - rejection based on Eq. 3.1.2 of Liechty thesis.      
+        {               
+            jDash = rndGen_.integer(0,jMax-1);
+            func = degeneracyList_[jDash]*
+                    exp((-electronicEnergyList_[jDash]/EMax))/expMax;
+        } while( !(func > rndGen_.scalar01()));
+    }
+
+    return jDash;
+}
+
+Foam::scalar Foam::dsmcCloud::postCollisionRotationalEnergy
+(
+    scalar rotationalDof,
+    scalar ChiB  
+)
+{
+    scalar energyRatio = 0.0;
+    
+    if(rotationalDof == 2.0)
+    {
+        energyRatio = 1.0 - pow(rndGen_.scalar01(),(1.0/ChiB));
+    }
+    else
+    {
+        scalar ChiA = 0.5*rotationalDof;
+        
+        scalar ChiAMinusOne = ChiA - 1;
+
+        scalar ChiBMinusOne = ChiB - 1;
+
+        if (ChiAMinusOne < SMALL && ChiBMinusOne < SMALL)
+        {
+            return rndGen_.scalar01();
+        }
+
+        scalar energyRatio;
+
+        scalar P;
+
+        do
+        {
+            P = 0;
+
+            energyRatio = rndGen_.scalar01();
+
+            if (ChiAMinusOne < SMALL)
+            {
+                P = pow((1.0 - energyRatio),ChiBMinusOne);
+            }
+            else if (ChiBMinusOne < SMALL)
+            {
+                P = pow((1.0 - energyRatio),ChiAMinusOne);
+            }
+            else
+            {
+                P =
+                    pow
+                    (
+                        (ChiAMinusOne + ChiBMinusOne)*energyRatio/ChiAMinusOne,
+                        ChiAMinusOne
+                    )
+                *pow
+                    (
+                        (ChiAMinusOne + ChiBMinusOne)*(1 - energyRatio)
+                        /ChiBMinusOne,
+                        ChiBMinusOne
+                    );
+            }
+        } while (P < rndGen_.scalar01());
+    }
+    
+    return energyRatio; 
+}
+
+Foam::label Foam::dsmcCloud::postCollisionVibrationalEnergyLevel
+(
+    bool postReaction,
+    label vibLevel,
+    label iMax,
+    scalar thetaV,
+    scalar thetaD,
+    scalar refTempZv,
+    scalar omega,
+    scalar Zref,
+    scalar Ec
+)
+{   
+    label iDash = vibLevel;
+    
+    if(postReaction)
+    {
+        // post-collision quantum number
+//         label iDash = 0; 
+        scalar func = 0.0;
+        scalar EVib = 0.0;
+
+        do // acceptance - rejection 
+        {
+            iDash = rndGen_.integer(0,iMax);
+            EVib = iDash*physicoChemical::k.value()*thetaV;
+            
+            // - equation 5.61, Bird
+            func = pow((1.0 - (EVib / Ec)),(1.5 - omega));
+
+        } while( !(func > rndGen_.scalar01()) );
+    }
+    else
+    {
+        // - "quantised collision temperature" (equation 3, Bird 2010), 
+        // denominator from Bird 5.42
+
+        scalar TColl = (iMax*thetaV) / (3.5 - omega);
+        
+        scalar pow1 = pow((thetaD/TColl),0.33333) - 1.0;
+
+        scalar pow2 = pow ((thetaD/refTempZv),0.33333) -1.0;
+
+        // - vibrational collision number (equation 2, Bird 2010)
+        scalar ZvP1 = pow((thetaD/TColl),omega); 
+        
+        scalar ZvP2 = 
+                pow(Zref*(pow((thetaD/refTempZv),(-1.0*omega))),(pow1/pow2));
+        
+        scalar Zv = ZvP1*ZvP2;
+        
+        //In order to obtain the relaxation rate corresponding to Zv with the
+        // collision energy-based procedure, the inelastic fraction should be 
+        // set to about 1/(5Zv) Bird 2008 RGD "A Comparison of Collison 
+        // Energy-Based and Temperature-Based..."
+        
+        scalar inverseVibrationalCollisionNumber = 1.0/(5.0*Zv);
+
+        if(inverseVibrationalCollisionNumber > rndGen_.scalar01())
+        {
+            // post-collision quantum number
+            scalar func = 0.0;
+            scalar EVib = 0.0;
+
+            do // acceptance - rejection 
+            {
+                iDash = rndGen_.integer(0,iMax);
+                EVib = iDash*physicoChemical::k.value()*thetaV;
+                
+                // - equation 5.61, Bird
+                func = pow((1.0 - (EVib / Ec)),(1.5 - omega));
+
+            } while( !(func > rndGen_.scalar01()) );
+        }
+    }
+    
+    return iDash;
+}
+
+Foam::label Foam::dsmcCloud::postCollisionElectronicEnergyLevel
+(
+    scalar Ec,
+    label jMax,
+    scalar omega,
+    List<scalar> EElist,
+    List<label> gList
+)
+{   
+    label nPossStates = 0;
+    label ELevel = -1;
+        
+    if(jMax == 1)
+    {
+        nPossStates = gList[0];
+    }
+    else
+    {
+        forAll(EElist, n)
+        {
+            if(Ec > EElist[n])
+            {
+                nPossStates += gList[n];
+            }
+        }
+    }
+    
+    label II = 0;
+    
+    do
+    {
+        label nState = ceil(rndGen_.scalar01()*(nPossStates));
+        label nAvailableStates = 0;
+        label nLevel = -1;
+        
+        forAll(EElist, n)
+        {
+            nAvailableStates += gList[n];
+            
+            if(nState <= nAvailableStates && nLevel < 0)
+            {
+                nLevel = n;
+            }
+        }
+
+        if(Ec > EElist[nLevel])
+        {
+            scalar prob = pow(1.0 - (EElist[nLevel]/Ec), 1.5-omega);
+            
+            if(prob > rndGen_.scalar01())
+            {
+                II = 1;
+                ELevel = nLevel;
+            }
+        }
+        
+    }while(II==0);
+    
+    return ELevel;
+}
+
+void Foam::dsmcCloud::dumpParticlePositions() const
+{
+    OFstream pObj
+    (
+        this->db().time().path()/"parcelPositions_"
+      + this->name() + "_"
+      + this->db().time().timeName() + ".obj"
+    );
+
+    forAllConstIter(dsmcCloud, *this, iter)
+    {
+        const dsmcParcel& p = iter();
+
+        pObj<< "v " << p.position().x()
+            << " "  << p.position().y()
+            << " "  << p.position().z()
+            << nl;
+    }
+
+    pObj.flush();
+}
+
+void Foam::dsmcCloud::reBuildCellOccupancy()
+{
+    buildCellOccupancy();
+}
+
+void Foam::dsmcCloud::axisymmetricWeighting()
+{
+//     reBuildCellOccupancy();
+    
+    forAll(cellOccupancy_, c)
+    {
+        const DynamicList<dsmcParcel*>& molsInCell = cellOccupancy_[c];
+        
+        point cC = mesh_.cellCentres()[c];
+        scalar radius = cC.y();
+
+        forAll(molsInCell, mIC)
+        {
+            dsmcParcel* p = molsInCell[mIC];
+                       
+//             scalar radius = sqrt(sqr(p->position().y()) 
+//                                             + sqr(p->position().z()));
+                       
+            scalar oldRadialWeight = p->RWF();
+            
+            scalar newRadialWeight = 1.0;
+
+            newRadialWeight = 1.0 + maxRWF_*(radius/radialExtent_);
+            
+            p->RWF() = newRadialWeight;
+            
+            if(oldRadialWeight > newRadialWeight) 
+            {
+                //particle might be cloned
+                
+                scalar prob = (oldRadialWeight/newRadialWeight) - 1.0;
+                
+                while(prob > 1.0)
+                {
+                    //add a particle and reduce prob by 1.0
+                   
+                    vector position = p->position();
+                    
+                    label cell = -1;
+                    label tetFace = -1;
+                    label tetPt = -1;
+
+                    mesh_.findCellFacePt
+                    (
+                        position,
+                        cell,
+                        tetFace,
+                        tetPt
+                    );
+                    
+                    //vector U = p->U();
+                    
+                    //U.z() *= -1.0;
+
+                    addNewParcel
+                    (
+                        position,
+                        p->U(),
+                        p->RWF(),
+                        p->ERot(),
+                        p->ELevel(),
+                        cell,
+                        tetFace,
+                        tetPt,
+                        p->typeId(),
+                        p->newParcel(),
+                        p->classification(),
+                        p->stuckToWall(),
+                        p->wallTemperature(),
+                        p->wallVectors(),
+                        p->vibLevel()
+                    );
+                    
+                    prob -= 1.0;
+                }
+                
+                if(prob > rndGen_.scalar01())
+                {
+                    vector position = p->position();
+                    
+                    label cell = -1;
+                    label tetFace = -1;
+                    label tetPt = -1;
+
+                    mesh_.findCellFacePt
+                    (
+                        position,
+                        cell,
+                        tetFace,
+                        tetPt
+                    );
+                    
+                   // vector U = p->U();
+                    
+                   // U.z() *= -1.0;
+
+                    addNewParcel
+                    (
+                        position,
+                        p->U(),
+                        p->RWF(),
+                        p->ERot(),
+                        p->ELevel(),
+                        cell,
+                        tetFace,
+                        tetPt,
+                        p->typeId(),
+                        p->newParcel(),
+                        p->classification(),
+                        p->stuckToWall(),
+                        p->wallTemperature(),
+                        p->wallVectors(),
+                        p->vibLevel()
+                    );
+                }
+            }
+            
+            if(newRadialWeight > oldRadialWeight)
+            {           
+                //particle might be deleted
+                if( (oldRadialWeight/newRadialWeight) < rndGen_.scalar01() )
+                {
+                    deleteParticle(*p);
+                } 
+            } 
+        }
+    }
+}
+
+void Foam::dsmcCloud::insertParcelInCellOccupancy(dsmcParcel* p)
+{
+    cellOccupancy_[p->cell()].append(p);
+    cellOccupancy_[p->cell()].shrink();
+}
+
+void Foam::dsmcCloud::removeParcelFromCellOccupancy
+(
+    const label& cellMolId,
+    const label& cell
+)
+{
+    DynamicList<dsmcParcel*> molsInCell(0);
+
+    forAll(cellOccupancy_[cell], c)
+    {
+        if(c != cellMolId)
+        {
+            molsInCell.append(cellOccupancy_[cell][c]);
+        }
+    }
+
+    molsInCell.shrink();
+    cellOccupancy_[cell].clear();
+    cellOccupancy_[cell].transfer(molsInCell);
+}
+
+
+// ************************************************************************* //

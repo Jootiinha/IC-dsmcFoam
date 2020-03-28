@@ -1,0 +1,44 @@
+#IncludeRegexLine: ^[ 	]*#[ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+../include/entropy.h
+stdbool.h
+-
+stdlib.h
+-
+
+../include/pcg_spinlock.h
+stdatomic.h
+-
+
+../include/pcg_variants.h
+inttypes.h
+-
+
+/home/joaocrm/Documentos/Pessoais/CUDA/cuda_dsmc/src/entropy.c
+stddef.h
+-
+stdlib.h
+-
+stdint.h
+-
+stdbool.h
+-
+time.h
+-
+pcg_variants.h
+/home/joaocrm/Documentos/Pessoais/CUDA/cuda_dsmc/src/pcg_variants.h
+pcg_spinlock.h
+/home/joaocrm/Documentos/Pessoais/CUDA/cuda_dsmc/src/pcg_spinlock.h
+entropy.h
+/home/joaocrm/Documentos/Pessoais/CUDA/cuda_dsmc/src/entropy.h
+fcntl.h
+-
+unistd.h
+-
+

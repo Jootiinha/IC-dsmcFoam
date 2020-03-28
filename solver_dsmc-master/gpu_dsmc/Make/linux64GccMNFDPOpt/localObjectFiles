@@ -1,0 +1,2 @@
+LOCAL_OBJECTS = \
+gpudsmcFoamPlus.o
